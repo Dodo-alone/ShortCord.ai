@@ -135,6 +135,7 @@ class SummarizerBot(commands.Bot):
         
         super().__init__(
             command_prefix='!',
+            help_command=None,
             intents=intents,
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
@@ -383,19 +384,3 @@ async def help_command(ctx):
 async def config_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need administrator permissions to use this command.")
-
-if __name__ == "__main__":
-    # Check for required environment variables
-    if not os.getenv('DISCORD_TOKEN'):
-        logger.error("DISCORD_TOKEN environment variable not set")
-        exit(1)
-    
-    if not os.getenv('GEMINI_API_KEY'):
-        logger.error("GEMINI_API_KEY environment variable not set")
-        exit(1)
-    
-    try:
-        bot.run(os.getenv('DISCORD_TOKEN'))
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        logger.error(traceback.format_exc())
