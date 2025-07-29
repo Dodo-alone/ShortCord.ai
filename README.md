@@ -160,20 +160,6 @@ The bot logs to both console and `bot.log` file:
 - Check `bot.log` for detailed error information
 - Logs rotate automatically to prevent disk space issues
 
-## Development
-
-### Project Structure
-```
-discord-summarizer-bot/
-├── bot.py              # Main bot code
-├── config.json         # Auto-generated configuration
-├── requirements.txt    # Python dependencies
-├── .env               # Environment variables (create from .env.example)
-├── .env.example       # Environment template
-├── bot.log            # Application logs
-└── README.md          # This file
-```
-
 ### Contributing
 1. Fork the repository
 2. Create feature branch
