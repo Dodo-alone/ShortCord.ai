@@ -25,7 +25,7 @@ A Discord bot that uses Google Gemini AI to summarize chat conversations with in
 ```bash
 # Clone or download the project files
 git clone https://github.com/Dodo-alone/ShortCord.ai
-cd discord-summarizer-bot
+cd summarizer.ai
 
 # Install dependencies
 pip install -r requirements.txt
