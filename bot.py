@@ -269,6 +269,9 @@ async def summarize(ctx, count: Optional[int] = None):
                 if count > bot.config.get('max_messages_limit'):
                     await ctx.send(f"Maximum message count is {bot.config.get('max_messages_limit')}.")
                     return
+                if count < 5:
+                    await ctx.send("Message count must be more than 5.")
+                    return
                 
                 # Get specific number of messages
                 messages = []
