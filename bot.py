@@ -1,131 +1,14 @@
 import discord
-from discord.ext import commands
-import google.generativeai as genai
 import asyncio
-import logging
-from datetime import datetime, timedelta
 import json
 import os
-from typing import Optional, List, Dict
-import time
-from collections import deque
 import traceback
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger('SummarizerBot')
-
-class RateLimiter:
-    """Rate limiter for Gemini API calls"""
-    def __init__(self):
-        # Gemini 2.5 Flash Lite limits: 15 req/min, 250k tokens/min, 1k req/day
-        self.requests_per_minute = deque(maxlen=15)
-        self.tokens_per_minute = deque(maxlen=250000)
-        self.requests_per_day = deque(maxlen=1000)
-        
-    async def can_make_request(self, estimated_tokens: int = 1000) -> bool:
-        """Check if we can make a request without hitting rate limits"""
-        now = time.time()
-        
-        # Clean old entries
-        minute_ago = now - 60
-        day_ago = now - 86400
-        
-        # Remove entries older than 1 minute
-        while self.requests_per_minute and self.requests_per_minute[0] < minute_ago:
-            self.requests_per_minute.popleft()
-        
-        # Remove tokens older than 1 minute
-        while self.tokens_per_minute and self.tokens_per_minute[0]['time'] < minute_ago:
-            self.tokens_per_minute.popleft()
-            
-        # Remove requests older than 1 day
-        while self.requests_per_day and self.requests_per_day[0] < day_ago:
-            self.requests_per_day.popleft()
-        
-        # Check limits
-        current_tokens = sum(entry['tokens'] for entry in self.tokens_per_minute)
-        
-        if (len(self.requests_per_minute) >= 14 or  # Leave buffer
-            current_tokens + estimated_tokens > 240000 or  # Leave buffer
-            len(self.requests_per_day) >= 950):  # Leave buffer
-            return False
-            
-        return True
-    
-    def record_request(self, tokens_used: int):
-        """Record a successful request"""
-        now = time.time()
-        self.requests_per_minute.append(now)
-        self.tokens_per_minute.append({'time': now, 'tokens': tokens_used})
-        self.requests_per_day.append(now)
-
-class Config:
-    """Configuration management"""
-    def __init__(self, config_file: str = 'config.json'):
-        self.config_file = config_file
-        self.default_config = {
-            "system_prompt": """You are a helpful Discord chat summarizer. Your task is to create concise, informative summaries of Discord conversations.
-
-Guidelines:
-- Identify distinct conversation topics and threads
-- Note when conversations are separated by significant time gaps (treat as separate discussions)
-- Highlight key decisions, announcements, or important information
-- Maintain context about who said what when relevant
-- Use clear, readable formatting with bullet points for multiple topics
-- Keep summaries concise but comprehensive
-- If there are inside jokes or references, briefly explain them if context allows
-- Note the time span of the conversation being summarized
-
-Format your response as a clean summary without excessive technical language.""",
-            "max_messages_default": 50,
-            "max_messages_limit": 200,
-            "time_gap_threshold_minutes": 30
-        }
-        self.config = self.load_config()
-    
-    def load_config(self) -> dict:
-        """Load configuration from file"""
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    config = json.load(f)
-                # Merge with defaults for any missing keys
-                for key, value in self.default_config.items():
-                    if key not in config:
-                        config[key] = value
-                return config
-            else:
-                self.save_config(self.default_config)
-                return self.default_config.copy()
-        except Exception as e:
-            logger.error(f"Error loading config: {e}")
-            return self.default_config.copy()
-    
-    def save_config(self, config: dict):
-        """Save configuration to file"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving config: {e}")
-    
-    def get(self, key: str):
-        """Get configuration value"""
-        return self.config.get(key)
-    
-    def set(self, key: str, value):
-        """Set configuration value"""
-        self.config[key] = value
-        self.save_config(self.config)
+import google.generativeai as genai
+from typing import Optional, List
+from discord.ext import commands
+from config import Config
+from ratelimiter import RateLimiter
+from logger import logger
 
 class SummarizerBot(commands.Bot):
     def __init__(self):
@@ -145,7 +28,6 @@ class SummarizerBot(commands.Bot):
         
         self.rate_limiter = RateLimiter()
         self.config = Config()
-        self.user_last_activity = {}  # Track user last activity
         
         # Initialize Gemini
         genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
@@ -157,10 +39,7 @@ class SummarizerBot(commands.Bot):
         logger.info(f'Connected to {len(self.guilds)} guilds')
     
     async def on_message(self, message):
-        """Track user activity and process commands"""
-        if not message.author.bot:
-            self.user_last_activity[message.author.id] = message.created_at
-        
+        """Process commands"""
         await self.process_commands(message)
     
     async def on_command_error(self, ctx, error):
@@ -177,21 +56,31 @@ class SummarizerBot(commands.Bot):
         """Rough token estimation (1 token ≈ 4 characters for English)"""
         return len(text) // 4
     
-    async def get_messages_until_last_active(self, channel, user_id: int, limit: int = 1000) -> List[discord.Message]:
-        """Get messages from when user was last active"""
-        if user_id not in self.user_last_activity:
-            # If no activity tracked, get recent messages
-            messages = []
-            async for message in channel.history(limit=min(limit, 100)):
-                messages.append(message)
-            return messages[::-1]  # Reverse to chronological order
-        
-        last_active = self.user_last_activity[user_id]
+    async def get_messages_since_user_activity(self, channel, user_id: int, limit: int = 1000) -> List[discord.Message]:
+        """Get messages by enumerating back until we find the calling user or hit limit"""
         messages = []
+        found_user = False
         
-        async for message in channel.history(limit=limit, after=last_active):
+        logger.info(f"Looking for messages since user {user_id} was last active (limit: {limit})")
+        
+        async for message in channel.history(limit=limit):
+            # Add message to our collection
             messages.append(message)
+            
+            # Check if this message is from the calling user (and not the command itself)
+            if message.author.id == user_id and not message.content.startswith('!'):
+                logger.info(f"Found user's last non-command message at {message.created_at}")
+                found_user = True
+                break
         
+        if not found_user:
+            logger.info(f"Did not find user's previous activity within {limit} messages, using all collected messages")
+        
+        # Remove the user's last message from the summary (we don't need to summarize back to their own message)
+        if found_user and messages:
+            messages = messages[:-1]  # Remove the last message (user's previous message)
+        
+        logger.info(f"Returning {len(messages)} messages for summarization")
         return messages[::-1]  # Reverse to chronological order
     
     def format_messages_for_ai(self, messages: List[discord.Message]) -> str:
@@ -256,21 +145,18 @@ class SummarizerBot(commands.Bot):
 # Create bot instance
 bot = SummarizerBot()
 
-@bot.command(name='summarize')
+@bot.command(name='summarize', aliases=["summarise"])
 async def summarize(ctx, count: Optional[int] = None):
     """Summarize recent messages or messages since user was last active"""
     async with ctx.typing():
         try:
             if count is not None:
                 # Validate count
-                if count <= 0:
-                    await ctx.send("Message count must be positive.")
+                if count <= 5:
+                    await ctx.send("Message count must be at least 5.")
                     return
                 if count > bot.config.get('max_messages_limit'):
                     await ctx.send(f"Maximum message count is {bot.config.get('max_messages_limit')}.")
-                    return
-                if count < 5:
-                    await ctx.send("Message count must be more than 5.")
                     return
                 
                 # Get specific number of messages
@@ -282,7 +168,7 @@ async def summarize(ctx, count: Optional[int] = None):
                 logger.info(f"Summarizing {len(messages)} messages by request from {ctx.author}")
             else:
                 # Get messages since user was last active
-                messages = await bot.get_messages_until_last_active(
+                messages = await bot.get_messages_since_user_activity(
                     ctx.channel, 
                     ctx.author.id,
                     bot.config.get('max_messages_default')
@@ -387,3 +273,19 @@ async def help_command(ctx):
 async def config_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("You need administrator permissions to use this command.")
+
+if __name__ == "__main__":
+    # Check for required environment variables
+    if not os.getenv('DISCORD_TOKEN'):
+        logger.error("DISCORD_TOKEN environment variable not set")
+        exit(1)
+    
+    if not os.getenv('GEMINI_API_KEY'):
+        logger.error("GEMINI_API_KEY environment variable not set")
+        exit(1)
+    
+    try:
+        bot.run(os.getenv('DISCORD_TOKEN'))
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        logger.error(traceback.format_exc())
