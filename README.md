@@ -24,8 +24,8 @@ A Discord bot that uses Google Gemini AI to summarize chat conversations with in
 
 ```bash
 # Clone or download the project files
-git clone
-cd discord-summarizer-bot
+git clone https://github.com/Dodo-alone/ShortCord.ai
+cd summarizer.ai
 
 # Install dependencies
 pip install -r requirements.txt
@@ -159,20 +159,6 @@ The bot logs to both console and `bot.log` file:
 ### Log Files
 - Check `bot.log` for detailed error information
 - Logs rotate automatically to prevent disk space issues
-
-## Development
-
-### Project Structure
-```
-discord-summarizer-bot/
-├── bot.py              # Main bot code
-├── config.json         # Auto-generated configuration
-├── requirements.txt    # Python dependencies
-├── .env               # Environment variables (create from .env.example)
-├── .env.example       # Environment template
-├── bot.log            # Application logs
-└── README.md          # This file
-```
 
 ### Contributing
 1. Fork the repository
