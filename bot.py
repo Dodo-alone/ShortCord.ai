@@ -5,7 +5,8 @@ import os
 import traceback
 import hashlib
 import secrets
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types
 from typing import Optional, List, Set
 from discord.ext import commands
 from config import Config
@@ -37,9 +38,8 @@ class SummarizerBot(commands.Bot):
         self.opted_out_users: Set[str] = set()  # Will store hashed user IDs
         self._load_opted_out_users()
         
-        # Initialize Gemini
-        genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Initialize Gemini with new API
+        self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
     
     def _load_or_create_salt(self) -> str:
         """Load existing salt or create a new one for hashing user IDs"""
@@ -141,8 +141,8 @@ class SummarizerBot(commands.Bot):
                     name="Legal",
                     value=(
                         "By using channels where this bot is present, you agree to our:\n"
-                        "• [Terms of Service](https://example.com/terms)\n"
-                        "• [Privacy Policy](https://example.com/privacy)\n"
+                        "• [Terms of Service](https://dodo-alone.github.io/ShortCord.ai/terms)\n"
+                        "• [Privacy Policy](https://dodo-alone.github.io/ShortCord.ai/privacy)\n"
                     ),
                     inline=False
                 )
@@ -238,11 +238,9 @@ class SummarizerBot(commands.Bot):
         return "\n".join(formatted_lines)
     
     async def generate_summary(self, formatted_messages: str) -> str:
-        """Generate summary using Gemini AI"""
-        full_prompt = f"{self.config.get('system_prompt')}\n\nMessages to summarize:\n{formatted_messages}"
-        
+        """Generate summary using Gemini AI with new API"""
         # Check token limits
-        estimated_tokens = self.estimate_tokens(full_prompt)
+        estimated_tokens = self.estimate_tokens(formatted_messages)
         if estimated_tokens > 1000000:  # Leave buffer for 1M token limit
             return "Error: Message history too long to summarize. Try with fewer messages."
         
@@ -252,16 +250,29 @@ class SummarizerBot(commands.Bot):
             return "Rate limit reached. Please wait before making another request."
         
         try:
+            # Create the request using the new API structure
+            request = {
+                "model": "gemini-2.0-flash-exp",
+                "config": types.GenerateContentConfig(
+                    system_instruction=self.config.get('system_prompt'),
+                    temperature=1),
+                "contents": [{"parts": [{"text": f"Messages to summarize:\n{formatted_messages}"}]}]
+            }
+            
+            # Generate content using the new API
             response = await asyncio.to_thread(
-                self.model.generate_content,
-                full_prompt
+                self.client.models.generate_content,
+                **request
             )
             
+            # Extract the response text
+            response_text = response.candidates[0].content.parts[0].text
+            
             # Record successful request
-            self.rate_limiter.record_request(estimated_tokens + self.estimate_tokens(response.text))
+            self.rate_limiter.record_request(estimated_tokens + self.estimate_tokens(response_text))
             
             logger.info(f"Generated summary with ~{estimated_tokens} input tokens")
-            return response.text
+            return response_text
             
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
