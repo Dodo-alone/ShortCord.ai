@@ -5,9 +5,10 @@ import os
 import traceback
 import hashlib
 import secrets
+import aiohttp
 import google.genai as genai
 from google.genai import types
-from typing import Optional, List, Set
+from typing import Optional, List, Set, Tuple
 from discord.ext import commands
 from config import Config
 from ratelimiter import RateLimiter
@@ -40,6 +41,15 @@ class SummarizerBot(commands.Bot):
         
         # Initialize Gemini with new API
         self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+        
+        # Supported media types
+        self.supported_image_types = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+        self.supported_video_types = {'video/mp4', 'video/mpeg', 'video/quicktime', 'video/webm'}
+        self.supported_audio_types = {'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm'}
+        
+        # File size limits (in bytes)
+        self.max_file_size = 20 * 1024 * 1024  # 20MB general limit
+        self.max_video_size = 100 * 1024 * 1024  # 100MB for video
     
     def _load_or_create_salt(self) -> str:
         """Load existing salt or create a new one for hashing user IDs"""
@@ -80,6 +90,127 @@ class SummarizerBot(commands.Bot):
         hashed_id = self._hash_user_id(user_id)
         return hashed_id in self.opted_out_users
     
+    def _get_mime_type(self, filename: str) -> Optional[str]:
+        """Get MIME type from file extension"""
+        ext = filename.lower().split('.')[-1]
+        mime_map = {
+            'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+            'png': 'image/png', 'gif': 'image/gif', 'webp': 'image/webp',
+            'mp4': 'video/mp4', 'mov': 'video/quicktime', 'webm': 'video/webm',
+            'mpeg': 'video/mpeg', 'mpg': 'video/mpeg',
+            'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
+            'weba': 'audio/webm', 'm4a': 'audio/mp4'
+        }
+        return mime_map.get(ext)
+    
+    def _is_supported_media(self, mime_type: str) -> bool:
+        """Check if the media type is supported by Gemini"""
+        return (mime_type in self.supported_image_types or 
+                mime_type in self.supported_video_types or 
+                mime_type in self.supported_audio_types)
+    
+    async def _download_attachment(self, attachment: discord.Attachment) -> Optional[Tuple[bytes, str]]:
+        """Download attachment and return bytes with mime type"""
+        try:
+            # Check file size limits
+            max_size = self.max_video_size if attachment.content_type and 'video' in attachment.content_type else self.max_file_size
+            if attachment.size > max_size:
+                logger.warning(f"Attachment {attachment.filename} too large: {attachment.size} bytes")
+                return None
+            
+            # Get MIME type
+            mime_type = attachment.content_type or self._get_mime_type(attachment.filename)
+            if not mime_type or not self._is_supported_media(mime_type):
+                logger.info(f"Unsupported media type for {attachment.filename}: {mime_type}")
+                return None
+            
+            # Download the file
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attachment.url) as response:
+                    if response.status == 200:
+                        data = await response.read()
+                        logger.info(f"Downloaded {attachment.filename}: {len(data)} bytes, type: {mime_type}")
+                        return data, mime_type
+                    else:
+                        logger.error(f"Failed to download {attachment.filename}: HTTP {response.status}")
+                        return None
+        except Exception as e:
+            logger.error(f"Error downloading attachment {attachment.filename}: {e}")
+            return None
+    
+    async def _process_embeds(self, message: discord.Message) -> List[str]:
+        """Process embeds and extract useful information"""
+        embed_info = []
+        
+        for embed in message.embeds:
+            embed_text = []
+            
+            if embed.title:
+                embed_text.append(f"**Embed Title:** {embed.title}")
+            
+            if embed.description:
+                embed_text.append(f"**Embed Description:** {embed.description}")
+            
+            if embed.url:
+                embed_text.append(f"**Embed URL:** {embed.url}")
+            
+            # Process embed fields
+            for field in embed.fields:
+                embed_text.append(f"**{field.name}:** {field.value}")
+            
+            # Handle embed images/videos
+            if embed.image:
+                embed_text.append(f"**Embed Image:** {embed.image.url}")
+            
+            if embed.video:
+                embed_text.append(f"**Embed Video:** {embed.video.url}")
+            
+            if embed.thumbnail:
+                embed_text.append(f"**Embed Thumbnail:** {embed.thumbnail.url}")
+            
+            if embed_text:
+                embed_info.append("\n".join(embed_text))
+        
+        return embed_info
+    
+    async def estimate_tokens_with_content_parts(self, content_parts: List) -> int:
+        """Estimate tokens for interlaced content parts using Gemini's count_tokens"""
+        try:
+            if not content_parts:
+                return 0
+            
+            # Use Gemini's token counting
+            count_result = await asyncio.to_thread(
+                self.client.models.count_tokens,
+                model='gemini-2.5-flash',
+                contents=[content_parts]
+            )
+            
+            total_tokens = count_result.total_tokens
+            media_count = sum(1 for part in content_parts if isinstance(part, types.Part))
+            logger.info(f"Estimated {total_tokens} tokens for content with {media_count} media parts")
+            return total_tokens
+            
+        except Exception as e:
+            logger.error(f"Error counting tokens: {e}")
+            # Fallback to simple estimation
+            estimated = 0
+            for part in content_parts:
+                if isinstance(part, str):
+                    estimated += len(part) // 4
+                elif isinstance(part, types.Part):
+                    # Add rough estimates for media
+                    if hasattr(part, 'mime_type'):
+                        if part.mime_type.startswith('image'):
+                            estimated += 500  # Rough estimate for images
+                        elif part.mime_type.startswith('video'):
+                            estimated += 2000  # Rough estimate for videos
+                        elif part.mime_type.startswith('audio'):
+                            estimated += 1000  # Rough estimate for audio
+            
+            logger.warning(f"Using fallback token estimation: {estimated}")
+            return estimated
+
     async def on_ready(self):
         """Bot ready event"""
         logger.info(f'{self.user} has connected to Discord!')
@@ -113,14 +244,18 @@ class SummarizerBot(commands.Bot):
             if target_channel:
                 embed = discord.Embed(
                     title="ShortCord Summarizer Bot",
-                    description="Welcome! I can help you summarize Discord conversations using AI.",
+                    description="Welcome! I can help you summarize Discord conversations using AI, including images, videos, and audio!",
                     color=0x00ff00
                 )
                 
                 embed.add_field(
                     name="What I Do",
                     value=(
-                        "I analyze chat messages and create concise summaries of conversations. "
+                        "I analyze chat messages and create concise summaries of conversations, including:\n"
+                        "• Text messages and embeds\n"
+                        "• Images (JPG, PNG, GIF, WebP)\n"
+                        "• Videos (MP4, MOV, WebM)\n"
+                        "• Audio files and voice messages\n"
                         "Use `!help` to see all available commands."
                     ),
                     inline=False
@@ -129,8 +264,8 @@ class SummarizerBot(commands.Bot):
                 embed.add_field(
                     name="Privacy Information",
                     value=(
-                        "• **No Message Storage**: I do not store user messages or generated summaries\n"
-                        "• **External API**: Message data is sent to Google's Gemini AI for processing\n"
+                        "• **No Message Storage**: I do not store user messages, media, or generated summaries\n"
+                        "• **External API**: Message data and media are sent to Google's Gemini AI for processing\n"
                         "• **Opt-Out Available**: Use `!optout` to exclude your messages from summaries\n"
                         "• **Opt-In**: Use `!optin` to re-enable summary inclusion"
                     ),
@@ -169,10 +304,6 @@ class SummarizerBot(commands.Bot):
         
         await ctx.send("An error occurred while processing your request. Please try again later.")
     
-    def estimate_tokens(self, text: str) -> int:
-        """Rough token estimation (1 token ≈ 4 characters for English)"""
-        return len(text) // 4
-    
     async def get_messages_since_user_activity(self, channel, user_id: int, limit: int = 1000) -> List[discord.Message]:
         """Get messages by enumerating back until we find the calling user or hit limit"""
         messages = []
@@ -200,14 +331,18 @@ class SummarizerBot(commands.Bot):
         logger.info(f"Returning {len(messages)} messages for summarization")
         return messages[::-1]  # Reverse to chronological order
     
-    def format_messages_for_ai(self, messages: List[discord.Message]) -> str:
-        """Format messages for AI processing, excluding opted-out users"""
+    async def format_messages_for_ai_interlaced(self, messages: List[discord.Message]) -> List:
+        """Format messages for AI processing with media interlaced at the correct positions"""
         if not messages:
-            return "No messages to summarize."
+            return []
         
-        formatted_lines = []
+        content_parts = []
         prev_time = None
         excluded_count = 0
+        media_count = 0
+        
+        # Add initial instruction
+        content_parts.append("Messages to summarize:\n")
         
         for message in messages:
             # Skip messages from opted-out users
@@ -217,31 +352,62 @@ class SummarizerBot(commands.Bot):
             
             # Check for time gaps
             if prev_time and (message.created_at - prev_time).total_seconds() > self.config.get('time_gap_threshold_minutes') * 60:
-                formatted_lines.append("\n--- TIME GAP ---\n")
+                content_parts.append("\n--- TIME GAP ---\n")
             
             # Format: Display Name | Message Content | Timestamp
             display_name = message.author.display_name or message.author.name
             timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
             content = message.content or "[No text content]"
             
-            # Handle attachments
-            if message.attachments:
-                attachment_info = f" [Attachments: {', '.join(att.filename for att in message.attachments)}]"
-                content += attachment_info
+            # Process embeds
+            embed_info = await self._process_embeds(message)
+            if embed_info:
+                content += " [Embeds: " + " | ".join(embed_info) + "]"
             
-            formatted_lines.append(f"{display_name} | {content} | {timestamp}")
+            # Add the text part of the message
+            message_text = f"{display_name} | {content} | {timestamp}"
+            content_parts.append(message_text)
+            
+            # Process attachments and add them immediately after the message text
+            if message.attachments:
+                for attachment in message.attachments:
+                    # Try to download and process media
+                    media_data = await self._download_attachment(attachment)
+                    if media_data:
+                        data, mime_type = media_data
+                        try:
+                            # Create a Part for the media and add it directly after the message
+                            media_part = types.Part.from_bytes(data=data, mime_type=mime_type)
+                            content_parts.append(media_part)
+                            media_count += 1
+                            logger.info(f"Added media part for {attachment.filename} ({mime_type}) after message")
+                        except Exception as e:
+                            logger.error(f"Error creating media part for {attachment.filename}: {e}")
+                            # Add a note about the failed media
+                            content_parts.append(f"[Media processing failed: {attachment.filename}]")
+                    else:
+                        # Add a note about unsupported attachment
+                        content_parts.append(f"[Unsupported attachment: {attachment.filename}]")
+            
             prev_time = message.created_at
         
         if excluded_count > 0:
             logger.info(f"Excluded {excluded_count} messages from opted-out users")
         
-        return "\n".join(formatted_lines)
+        if media_count > 0:
+            logger.info(f"Processed {media_count} media attachments interlaced with messages")
+        
+        return content_parts
     
-    async def generate_summary(self, formatted_messages: str) -> str:
-        """Generate summary using Gemini AI with new API"""
+    async def generate_summary(self, content_parts: List) -> str:
+        """Generate summary using Gemini AI with interlaced multimodal content"""
+        # Check if we have any content
+        if not content_parts:
+            return "No content available to summarize."
+        
         # Check token limits
-        estimated_tokens = self.estimate_tokens(formatted_messages)
-        if estimated_tokens > 1000000:  # Leave buffer for 1M token limit
+        estimated_tokens = await self.estimate_tokens_with_content_parts(content_parts)
+        if estimated_tokens > 1000000:  # Conservative limit for 1M context
             return "Error: Message history too long to summarize. Try with fewer messages."
         
         # Check rate limits
@@ -252,11 +418,13 @@ class SummarizerBot(commands.Bot):
         try:
             # Create the request using the new API structure
             request = {
-                "model": "gemini-2.0-flash-exp",
+                "model": "gemini-2.5-flash-lite",
                 "config": types.GenerateContentConfig(
                     system_instruction=self.config.get('system_prompt'),
-                    temperature=1),
-                "contents": [{"parts": [{"text": f"Messages to summarize:\n{formatted_messages}"}]}]
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    temperature=1
+                ),
+                "contents": [content_parts]
             }
             
             # Generate content using the new API
@@ -268,10 +436,13 @@ class SummarizerBot(commands.Bot):
             # Extract the response text
             response_text = response.candidates[0].content.parts[0].text
             
-            # Record successful request
-            self.rate_limiter.record_request(estimated_tokens + self.estimate_tokens(response_text))
+            # Record successful request (estimate response tokens)
+            response_tokens = response.usage_metadata.candidates_token_count # Simple estimation for response
+            if response_tokens is None: response_tokens = 0
+            self.rate_limiter.record_request(estimated_tokens + response_tokens)
             
-            logger.info(f"Generated summary with ~{estimated_tokens} input tokens")
+            media_count = sum(1 for part in content_parts if isinstance(part, types.Part))
+            logger.info(f"Generated summary with ~{estimated_tokens} input tokens and {media_count} interlaced media parts")
             return response_text
             
         except Exception as e:
@@ -300,7 +471,7 @@ async def summarize(ctx, count: Optional[int] = None):
                 messages = []
                 async for message in ctx.channel.history(limit=count):
                     messages.append(message)
-                messages = messages[::-1]  # Reverse to chronological order
+                messages = messages[-2::-1]  # Reverse to chronological order
                 
                 logger.info(f"Summarizing {len(messages)} messages by request from {ctx.author}")
             else:
@@ -316,27 +487,32 @@ async def summarize(ctx, count: Optional[int] = None):
                 await ctx.send("No messages found to summarize.")
                 return
             
-            # Format and generate summary
-            formatted_messages = bot.format_messages_for_ai(messages)
+            # Format messages with interlaced media
+            content_parts = await bot.format_messages_for_ai_interlaced(messages)
             
             # Check if there are any messages left after filtering opted-out users
-            if not formatted_messages.strip() or formatted_messages.strip() == "No messages to summarize.":
+            if not content_parts or len(content_parts) <= 1:  # Only the instruction part
                 await ctx.send("No messages available to summarize after privacy filtering.")
                 return
             
-            summary = await bot.generate_summary(formatted_messages)
+            summary = await bot.generate_summary(content_parts)
+            
+            # Count media parts for display
+            media_count = sum(1 for part in content_parts if isinstance(part, types.Part))
             
             # Split long summaries if needed
-            if len(summary) > 2000:
+            if len(summary) >= 2000:
                 # Discord message limit is 2000 characters
                 chunks = [summary[i:i+1900] for i in range(0, len(summary), 1900)]
                 for i, chunk in enumerate(chunks):
                     if i == 0:
-                        await ctx.send(f"**Summary of {len(messages)} messages:**\n{chunk}")
+                        media_note = f" (including {media_count} media files)" if media_count > 0 else ""
+                        await ctx.send(f"**Summary of {len(messages)} messages{media_note}:**\n{chunk}")
                     else:
                         await ctx.send(chunk)
             else:
-                await ctx.send(f"**Summary of {len(messages)} messages:**\n{summary}")
+                media_note = f" (including {media_count} media files)" if media_count > 0 else ""
+                await ctx.send(f"**Summary of {len(messages)} messages{media_note}:**\n{summary}")
                 
         except Exception as e:
             logger.error(f"Error in summarize command: {e}")
@@ -358,13 +534,14 @@ async def opt_out(ctx):
         
         embed = discord.Embed(
             title="Opted Out Successfully",
-            description="Your messages will no longer be included in summaries.",
+            description="Your messages and media will no longer be included in summaries.",
             color=0xff9900
         )
         embed.add_field(
             name="What this means:",
             value=(
                 "• Your messages won't be sent to Google's AI for processing\n"
+                "• Your media attachments won't be analyzed\n"
                 "• Your messages won't appear in any generated summaries\n"
                 "• You can opt back in anytime using `!optin`"
             ),
@@ -393,13 +570,14 @@ async def opt_in(ctx):
         
         embed = discord.Embed(
             title="Opted In Successfully",
-            description="Your messages will now be included in summaries again.",
+            description="Your messages and media will now be included in summaries again.",
             color=0x00ff00
         )
         embed.add_field(
             name="What this means:",
             value=(
                 "• Your messages may be sent to Google's AI for processing\n"
+                "• Your media attachments may be analyzed\n"
                 "• Your messages may appear in generated summaries\n"
                 "• You can opt out anytime using `!optout`"
             ),
@@ -466,8 +644,8 @@ async def config_command(ctx, key: str = None, *, value: str = None):
 async def help_command(ctx):
     """Show help information"""
     help_embed = discord.Embed(
-        title="AI Text Summarizer Bot",
-        description="Summarize Discord conversations using AI",
+        title="AI Multimodal Summarizer Bot",
+        description="Summarize Discord conversations including text, images, videos, and audio using AI",
         color=0x00ff00
     )
     
@@ -481,10 +659,21 @@ async def help_command(ctx):
     )
     
     help_embed.add_field(
+        name="Supported Media Types",
+        value=(
+            "**Images:** JPG, PNG, GIF, WebP\n"
+            "**Videos:** MP4, MOV, WebM, MPEG\n"
+            "**Audio:** MP3, WAV, OGG, Discord voice messages\n"
+            "**Other:** Embeds and text content"
+        ),
+        inline=False
+    )
+    
+    help_embed.add_field(
         name="Privacy Commands",
         value=(
-            "`!optout` - Exclude your messages from all summaries\n"
-            "`!optin` - Re-include your messages in summaries"
+            "`!optout` - Exclude your messages and media from all summaries\n"
+            "`!optin` - Re-include your messages and media in summaries"
         ),
         inline=False
     )
@@ -502,21 +691,25 @@ async def help_command(ctx):
     help_embed.add_field(
         name="Privacy Information",
         value=(
-            "• Messages are sent to Google's Gemini AI for processing\n"
-            "• No messages or summaries are stored by this bot\n"
-            "• Use `!optout` to exclude your messages from processing\n"
+            "• Messages and media are sent to Google's Gemini AI for processing\n"
+            "• No messages, media, or summaries are stored by this bot\n"
+            "• Use `!optout` to exclude your content from processing\n"
             "• View our [Terms](https://dodo-alone.github.io/ShortCord.ai/terms) and [Privacy Policy](https://dodo-alone.github.io/ShortCord.ai/privacy)"
         ),
         inline=False
     )
     
     help_embed.add_field(
-        name="Rate Limits",
-        value="The bot has built-in rate limiting to prevent API overuse.",
+        name="File Limits",
+        value=(
+            "• Images, Audio: 20MB max\n"
+            "• Videos: 100MB max\n"
+            "• Rate limiting applies to prevent API overuse"
+        ),
         inline=False
     )
     
-    help_embed.set_footer(text="Powered by Google Gemini AI")
+    help_embed.set_footer(text="Powered by Google Gemini 2.5 Flash AI")
     
     await ctx.send(embed=help_embed)
 
