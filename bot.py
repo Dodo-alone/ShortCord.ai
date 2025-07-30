@@ -494,7 +494,7 @@ async def help_command(ctx):
             "• Messages are sent to Google's Gemini AI for processing\n"
             "• No messages or summaries are stored by this bot\n"
             "• Use `!optout` to exclude your messages from processing\n"
-            "• View our [Terms](https://example.com/terms) and [Privacy Policy](https://example.com/privacy)"
+            "• View our [Terms](https://dodo-alone.github.io/ShortCord.ai/terms) and [Privacy Policy](https://dodo-alone.github.io/ShortCord.ai/privacy)"
         ),
         inline=False
     )

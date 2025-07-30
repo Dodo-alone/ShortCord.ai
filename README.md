@@ -60,6 +60,11 @@ GEMINI_API_KEY=your_gemini_api_key_here
 python bot.py
 ```
 
+### 5. Final considerations
+
+- Should you serve an instance of this bot to other users you should make available a copy of the terms of service and the privacy agreement
+- We are not responsible for any instances of this bot other than ones hosted by ourselves
+
 ## Commands
 
 - `!summarize` - Summarize messages since you were last active
@@ -67,6 +72,7 @@ python bot.py
 - `!help` - Show help information
 
 ### Admin Commands (Administrator permission required)
+
 - `!config` - View current configuration
 - `!config <key>` - View specific configuration value
 - `!config <key> <value>` - Set configuration value
@@ -107,6 +113,7 @@ Display Name | Message after break | 2024-01-01 13:00:00 UTC
 - Rate limiting prevents API abuse
 - Admin-only configuration commands
 - Environment variable protection for secrets
+- Option for users to opt out of summarization
 
 ### ⚠️ Privacy Considerations
 - **Message Access**: Bot can read all messages in channels it's added to
@@ -115,6 +122,7 @@ Display Name | Message after break | 2024-01-01 13:00:00 UTC
 ### 🔒 Recommendations
 - Only add bot to channels where summarization is needed
 - Review Google's [Gemini API Privacy Policy](https://ai.google.dev/terms)
+- Review Our [Terms](https://dodo-alone.github.io/ShortCord.ai/terms) and [Privacy Policy](https://dodo-alone.github.io/ShortCord.ai/privacy)
 - Consider channel permissions carefully
 - Inform users that their messages may be summarized
 - Regularly rotate API keys
