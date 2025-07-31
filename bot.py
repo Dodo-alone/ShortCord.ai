@@ -8,7 +8,7 @@ import secrets
 import aiohttp
 import google.genai as genai
 from google.genai import types
-from typing import Optional, List, Set, Tuple
+from typing import Optional, List, Set, Tuple, Dict
 from discord.ext import commands
 from config import Config
 from ratelimiter import RateLimiter
@@ -172,6 +172,69 @@ class SummarizerBot(commands.Bot):
                 embed_info.append("\n".join(embed_text))
         
         return embed_info
+    
+    def _process_reactions(self, message: discord.Message) -> str:
+        """Process message reactions and return formatted string"""
+        if not message.reactions:
+            return ""
+        
+        reaction_info = []
+        for reaction in message.reactions:
+            # Get emoji name (handle both unicode and custom emojis)
+            if isinstance(reaction.emoji, str):
+                emoji_name = reaction.emoji  # Unicode emoji
+            else:
+                emoji_name = f":{reaction.emoji.name}:"  # Custom emoji
+            
+            # Get list of users who reacted (async, so we'll need to handle this carefully)
+            # For now, we'll just show the count and emoji
+            reaction_info.append(f"{emoji_name}({reaction.count})")
+        
+        return f" [Reactions: {', '.join(reaction_info)}]" if reaction_info else ""
+    
+    async def _get_reaction_users(self, message: discord.Message) -> str:
+        """Get detailed reaction information including users"""
+        if not message.reactions:
+            return ""
+        
+        reaction_details = []
+        try:
+            for reaction in message.reactions:
+                # Get emoji name
+                if isinstance(reaction.emoji, str):
+                    emoji_name = reaction.emoji
+                else:
+                    emoji_name = f":{reaction.emoji.name}:"
+                
+                # Get users who reacted (limit to avoid spam)
+                users = []
+                async for user in reaction.users():
+                    if len(users) >= 5:  # Limit to first 5 users to avoid spam
+                        break
+                    if not self._is_user_opted_out(user.id):  # Respect privacy
+                        users.append(user.display_name or user.name)
+                
+                if users:
+                    if reaction.count > len(users):
+                        user_list = f"{', '.join(users)} and {reaction.count - len(users)} others"
+                    else:
+                        user_list = ', '.join(users)
+                    reaction_details.append(f"{emoji_name}: {user_list}")
+                else:
+                    reaction_details.append(f"{emoji_name}: {reaction.count} users")
+                    
+        except Exception as e:
+            logger.error(f"Error processing reaction users: {e}")
+            return self._process_reactions(message)  # Fallback to simple reaction processing
+        
+        return f" [Reactions: {' | '.join(reaction_details)}]" if reaction_details else ""
+    
+    def _create_message_id_map(self, messages: List[discord.Message]) -> Dict[int, int]:
+        """Create a mapping from Discord message ID to sequential message ID"""
+        message_id_map = {}
+        for i, message in enumerate(messages, 1):
+            message_id_map[message.id] = i
+        return message_id_map
     
     async def estimate_tokens_with_content_parts(self, content_parts: List) -> int:
         """Estimate tokens for interlaced content parts using Gemini's count_tokens"""
@@ -341,8 +404,8 @@ class SummarizerBot(commands.Bot):
         excluded_count = 0
         media_count = 0
         
-        # Add initial instruction
-        content_parts.append("Messages to summarize:\n")
+        # Create message ID mapping for replies
+        message_id_map = self._create_message_id_map(messages)
         
         for message in messages:
             # Skip messages from opted-out users
@@ -354,40 +417,60 @@ class SummarizerBot(commands.Bot):
             if prev_time and (message.created_at - prev_time).total_seconds() > self.config.get('time_gap_threshold_minutes') * 60:
                 content_parts.append("\n--- TIME GAP ---\n")
             
-            # Format: Display Name | Message Content | Timestamp
+            # Get message details
             display_name = message.author.display_name or message.author.name
             timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
             content = message.content or "[No text content]"
+            message_id = message_id_map[message.id]
+            
+            # Check for reply
+            reply_info = ""
+            if message.reference and message.reference.message_id:
+                replied_to_id = message_id_map.get(message.reference.message_id)
+                if replied_to_id:
+                    reply_info = f" [Replying to Message #{replied_to_id}]"
+                else:
+                    reply_info = " [Replying to message outside conversation]"
             
             # Process embeds
             embed_info = await self._process_embeds(message)
             if embed_info:
                 content += " [Embeds: " + " | ".join(embed_info) + "]"
             
-            # Add the text part of the message
-            message_text = f"{display_name} | {content} | {timestamp}"
+            # Process reactions with user details
+            reaction_info = await self._get_reaction_users(message)
+            
+            # Format: Message ID | Display Name | Message Content | Reply Info | Reactions | Timestamp
+            message_text = f"Message #{message_id} | {display_name} | {content}{reply_info}{reaction_info} | {timestamp}"
             content_parts.append(message_text)
             
-            # Process attachments and add them immediately after the message text
+            # Process attachments and add them immediately after the message text with attribution
             if message.attachments:
-                for attachment in message.attachments:
+                for i, attachment in enumerate(message.attachments):
                     # Try to download and process media
                     media_data = await self._download_attachment(attachment)
                     if media_data:
                         data, mime_type = media_data
                         try:
-                            # Create a Part for the media and add it directly after the message
+                            # Create a Part for the media and add it with clear attribution
                             media_part = types.Part.from_bytes(data=data, mime_type=mime_type)
+                            
+                            # Add attribution text before the media
+                            media_type = "Image" if mime_type.startswith('image') else \
+                                       "Video" if mime_type.startswith('video') else \
+                                       "Audio" if mime_type.startswith('audio') else "Media"
+                            
+                            content_parts.append(f"[{media_type} from Message #{message_id} by {display_name}: {attachment.filename}]")
                             content_parts.append(media_part)
                             media_count += 1
-                            logger.info(f"Added media part for {attachment.filename} ({mime_type}) after message")
+                            logger.info(f"Added attributed media part for {attachment.filename} ({mime_type}) from message #{message_id}")
                         except Exception as e:
                             logger.error(f"Error creating media part for {attachment.filename}: {e}")
-                            # Add a note about the failed media
-                            content_parts.append(f"[Media processing failed: {attachment.filename}]")
+                            # Add a note about the failed media with attribution
+                            content_parts.append(f"[Media processing failed for Message #{message_id} by {display_name}: {attachment.filename}]")
                     else:
-                        # Add a note about unsupported attachment
-                        content_parts.append(f"[Unsupported attachment: {attachment.filename}]")
+                        # Add a note about unsupported attachment with attribution
+                        content_parts.append(f"[Unsupported attachment in Message #{message_id} by {display_name}: {attachment.filename}]")
             
             prev_time = message.created_at
         
@@ -395,7 +478,7 @@ class SummarizerBot(commands.Bot):
             logger.info(f"Excluded {excluded_count} messages from opted-out users")
         
         if media_count > 0:
-            logger.info(f"Processed {media_count} media attachments interlaced with messages")
+            logger.info(f"Processed {media_count} attributed media attachments")
         
         return content_parts
     
@@ -469,9 +552,9 @@ async def summarize(ctx, count: Optional[int] = None):
                 
                 # Get specific number of messages
                 messages = []
-                async for message in ctx.channel.history(limit=count):
+                async for message in ctx.channel.history(limit=count+1):
                     messages.append(message)
-                messages = messages[-2::-1]  # Reverse to chronological order
+                messages = messages[:0:-1]  # Reverse to chronological order
                 
                 logger.info(f"Summarizing {len(messages)} messages by request from {ctx.author}")
             else:
