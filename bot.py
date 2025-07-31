@@ -536,7 +536,7 @@ class SummarizerBot(commands.Bot):
 # Create bot instance
 bot = SummarizerBot()
 
-@bot.command(name='summarize', aliases=["summarise"])
+@bot.command(name='summarize', aliases=["summarise", "Summarize", "Summarise"])
 async def summarize(ctx, count: Optional[int] = None):
     """Summarize recent messages or messages since user was last active"""
     async with ctx.typing():
@@ -715,6 +715,9 @@ async def config_command(ctx, key: str = None, *, value: str = None):
             parsed_value = json.loads(value)
         except json.JSONDecodeError:
             parsed_value = value
+
+        if bot.config.get(key) is None:
+            await ctx.send(f"There is no setting {key}")
         
         bot.config.set(key, parsed_value)
         await ctx.send(f"Configuration updated: **{key}** = {parsed_value}")
