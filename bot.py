@@ -583,14 +583,21 @@ async def summarize(ctx, count: Optional[int] = None):
             # Count media parts for display
             media_count = sum(1 for part in content_parts if isinstance(part, types.Part))
             
-            # Split long summaries if needed
+            # Smart splitting for long summaries
             if len(summary) >= 2000:
-                # Discord message limit is 2000 characters
-                chunks = [summary[i:i+1900] for i in range(0, len(summary), 1900)]
+                chunks = smart_split_message(summary, max_length=1900)  # Leave buffer for headers
+                
                 for i, chunk in enumerate(chunks):
                     if i == 0:
                         media_note = f" (including {media_count} media files)" if media_count > 0 else ""
-                        await ctx.send(f"**Summary of {len(messages)} messages{media_note}:**\n{chunk}")
+                        header = f"**Summary of {len(messages)} messages{media_note}:**\n"
+                        
+                        # Check if header + chunk exceeds limit
+                        if len(header + chunk) > 2000:
+                            await ctx.send(header.rstrip())  # Send header separately
+                            await ctx.send(chunk)
+                        else:
+                            await ctx.send(header + chunk)
                     else:
                         await ctx.send(chunk)
             else:
@@ -601,6 +608,71 @@ async def summarize(ctx, count: Optional[int] = None):
             logger.error(f"Error in summarize command: {e}")
             logger.error(traceback.format_exc())
             await ctx.send("An error occurred while generating the summary.")
+
+
+def smart_split_message(text: str, max_length: int = 1900) -> list[str]:
+    """
+    Split text into chunks while preserving word boundaries and formatting.
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    remaining_text = text
+    
+    while len(remaining_text) > max_length:
+        split_point = find_best_split_point(remaining_text, max_length)
+        
+        if split_point == -1:
+            split_point = max_length
+        
+        # Extract the chunk and update remaining text
+        chunk = remaining_text[:split_point].rstrip()
+        chunks.append(chunk)
+        remaining_text = remaining_text[split_point:].lstrip()
+    
+    if remaining_text.strip():
+        chunks.append(remaining_text.strip())
+    
+    return chunks
+
+
+def find_best_split_point(text: str, max_length: int) -> int:
+    """
+    Find the best point to split text, prioritizing different break types.
+    
+    Returns the index where to split, or -1 if no good split point found.
+    """
+    if len(text) <= max_length:
+        return len(text)
+    
+    # Define split points in order of preference (best to worst)
+    split_patterns = [
+        '\n\n',
+        '. ', 
+        '.\n',
+        '! ',
+        '?\n',
+        '? ',
+        '!\n',
+        '\n',
+        '; ',
+        ', ',
+        ' - ',
+        ' ',
+    ]
+    
+    for pattern in split_patterns:
+        # Find all occurrences of this pattern within the valid range
+        search_text = text[:max_length]
+        last_occurrence = search_text.rfind(pattern)
+        
+        if last_occurrence != -1:
+            # Return position after the pattern
+            return last_occurrence + len(pattern)
+    
+    # No good split point found
+    return -1
 
 @bot.command(name='optout')
 async def opt_out(ctx):
