@@ -1,29 +1,38 @@
-#!/usr/bin/env python3
+"""
+Entry point for the Discord Summarizer Bot
+"""
 
 import os
+import traceback
 from dotenv import load_dotenv
+from bot import SummarizerBot
+from core.logger import logger
 
-# Load environment variables from .env file
-load_dotenv()
 
-# Import and run the bot
-if __name__ == "__main__":
-    from bot import bot
-    
-    # Verify required environment variables
-    required_vars = ['DISCORD_TOKEN', 'GEMINI_API_KEY']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        print(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
-        print("Please check your .env file and ensure all required variables are set.")
+def main():
+    """Main entry point"""
+    # Check for required environment variables
+
+    load_dotenv()
+
+    if not os.getenv('DISCORD_TOKEN'):
+        logger.error("DISCORD_TOKEN environment variable not set")
         exit(1)
     
-    print("Starting Discord AI Summarizer Bot...")
+    if not os.getenv('GEMINI_API_KEY'):
+        logger.error("GEMINI_API_KEY environment variable not set")
+        exit(1)
+    
     try:
+        # Create and run the bot
+        bot = SummarizerBot()
         bot.run(os.getenv('DISCORD_TOKEN'))
     except KeyboardInterrupt:
-        print("\nBot stopped by user.")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        print(f"Error starting bot: {e}")
-        exit(1)
+        logger.error(f"Failed to start bot: {e}")
+        logger.error(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
